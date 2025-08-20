@@ -1,43 +1,137 @@
-name: Pull Nginx Image
+name: Pull Images from Issue
 
 on:
-  push:
-    branches:
-      - main
+  issues:
+    types: [opened, edited, reopened, labeled]
   workflow_dispatch:
     inputs:
-      nginx-version:
-        description: 'nginx version (tag)'
+      images_yaml:
+        description: 'YAML that contains images list (same format as issue body).'
         required: false
-        default: 'latest'
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
-  pull-nginx:
+  pull-and-upload:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set nginx version
-        run: echo "NGINX_VER=${{ github.event.inputs['nginx-version'] || 'latest' }}" >> $GITHUB_ENV
-
-      - name: Pull nginx image
+      - name: Prepare images YAML source
+        id: source
         run: |
-          echo "Pulling nginx:${NGINX_VER}"
-          docker pull nginx:${NGINX_VER}
+          # choose source: workflow_dispatch input (if provided) else issue body (if triggered by issue) else exit
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.images_yaml }}" ]; then
+            echo "Using workflow_dispatch input"
+            printf "%s" "${{ github.event.inputs.images_yaml }}" > images_input.yaml
+          else
+            # github.event.issue.body may be empty for non-issue triggers
+            BODY="${{ github.event.issue.body || '' }}"
+            if [ -z "$BODY" ]; then
+              echo "No issue body or dispatch input found. Exiting."
+              exit 1
+            fi
+            printf "%s" "$BODY" > images_input.yaml
+          fi
+          echo "Saved images_input.yaml:"
+          sed -n '1,200p' images_input.yaml
 
-      - name: Show pulled image
-        run: docker image ls nginx --format '{{.Repository}}:{{.Tag}}\t{{.Size}}'
-
-      - name: Save image to tar
+      - name: Install Python yaml parser
         run: |
-          TAR_NAME=nginx-${NGINX_VER}.tar
-          docker save -o $TAR_NAME nginx:${NGINX_VER}
-          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+          python3 -m pip install --user pyyaml
+          export PATH="$HOME/.local/bin:$PATH"
+          python3 - <<'PY'
+import sys, yaml
+with open('images_input.yaml', 'r') as f:
+    try:
+        doc = yaml.safe_load(f) or {}
+    except Exception as e:
+        print("Failed to parse YAML:", e, file=sys.stderr)
+        sys.exit(1)
+imgs = doc.get('images', [])
+if not isinstance(imgs, list) or not imgs:
+    print("No images list found under 'images' key", file=sys.stderr)
+    sys.exit(2)
+# emit lines "image|tag"
+with open('images_list.txt','w') as out:
+    for item in imgs:
+        if not isinstance(item, dict): continue
+        image = item.get('image')
+        tag = item.get('tag','latest')
+        if image:
+            out.write(f"{image}|{tag}\n")
+print("Wrote images_list.txt")
+PY
 
-      - name: Upload image artifact
+      - name: Show images to pull
+        run: |
+          echo "Images to pull:"
+          cat images_list.txt
+
+      - name: Pull images and save tars
+        env:
+          DOCKER_CLI_EXPERIMENTAL: enabled
+        run: |
+          set -euo pipefail
+          mkdir -p pulled_images
+          while IFS='|' read -r image tag; do
+            if [ -z "$image" ]; then continue; fi
+            full="${image}:${tag}"
+            echo "Pulling $full ..."
+            docker pull "$full"
+            # sanitize filename
+            file="$(echo "${image}_${tag}" | sed -E 's/[:\/]+/_/g').tar"
+            outpath="pulled_images/$file"
+            echo "Saving $full -> $outpath"
+            docker save -o "$outpath" "$full"
+          done < images_list.txt
+          echo "Saved files:"
+          ls -lh pulled_images || true
+
+      - name: Upload images artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nginx-image-${{ env.NGINX_VER }}
-          path: ${{ env.TAR_NAME }}
+          name: pulled-images-${{ github.run_id }}
+          path: pulled_images/*.tar
+
+      - name: List artifacts and print download links
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+import os, requests, sys
+token = os.environ.get('GITHUB_TOKEN')
+repo = os.environ.get('REPO')
+run_id = os.environ.get('RUN_ID')
+if not token or not repo or not run_id:
+    print("Missing env vars", file=sys.stderr); sys.exit(1)
+owner, name = repo.split('/')
+url = f"https://api.github.com/repos/{owner}/{name}/actions/runs/{run_id}/artifacts"
+h = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+r = requests.get(url, headers=h)
+if r.status_code != 200:
+    print("Failed to fetch artifacts:", r.status_code, r.text, file=sys.stderr); sys.exit(2)
+data = r.json()
+if not data.get('artifacts'):
+    print("No artifacts found.")
+    sys.exit(0)
+print("Artifacts for this run:")
+for a in data['artifacts']:
+    print(f"- name: {a.get('name')}")
+    print(f"  size_in_bytes: {a.get('size_in_bytes')}")
+    # archive_download_url requires Authorization header to download
+    print(f"  archive_download_url: {a.get('archive_download_url')}")
+print("")
+print("Note: the archive_download_url requires authentication (GITHUB_TOKEN) and is temporary.")
+PY
+
+      - name: Cleanup tar files
+        if: always()
+        run: |
+          rm -rf pulled_images || true
