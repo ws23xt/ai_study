@@ -5,13 +5,39 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      nginx-version:
+        description: 'nginx version (tag)'
+        required: false
+        default: 'latest'
 
 jobs:
   pull-nginx:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Pull Nginx Image
-        uses: ./.github/actions/pull-nginx
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set nginx version
+        run: echo "NGINX_VER=${{ github.event.inputs['nginx-version'] || 'latest' }}" >> $GITHUB_ENV
+
+      - name: Pull nginx image
+        run: |
+          echo "Pulling nginx:${NGINX_VER}"
+          docker pull nginx:${NGINX_VER}
+
+      - name: Show pulled image
+        run: docker image ls nginx --format '{{.Repository}}:{{.Tag}}\t{{.Size}}'
+
+      - name: Save image to tar
+        run: |
+          TAR_NAME=nginx-${NGINX_VER}.tar
+          docker save -o $TAR_NAME nginx:${NGINX_VER}
+          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
         with:
-          nginx-version: 'latest'
+          name: nginx-image-${{ env.NGINX_VER }}
+          path: ${{ env.TAR_NAME }}
