@@ -1,0 +1,17 @@
+name: Pull Nginx Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  pull-nginx:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Pull Nginx Image
+        uses: ./.github/actions/pull-nginx
+        with:
+          nginx-version: 'latest'
